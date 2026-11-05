@@ -1,0 +1,334 @@
+//@version=6
+indicator("DRT MSS Pullback", shorttitle = "DRT", overlay = true,
+     max_lines_count = 100, max_labels_count = 500, max_boxes_count = 300)
+
+// Bullish DRT: the swing low before the swing high that a bullish MSS closes
+// through, up to that high. The MSS candle completes the range and freezes
+// High, Low, and EQ.
+// Bearish DRT: the swing high before the swing low that a bearish MSS closes
+// through, down to that low.
+//
+// Long, after that bullish MSS:
+// 1. The MSS completes the DRT.
+// 2. A later candle trades the high and closes back inside. A bearish
+//    engulfing on that candle, or a later one, starts the pullback.
+// 3. A candle after the engulfing trades the EQ or below.
+// 4. The order block is a bearish candle that trades the EQ or below.
+// 5. The next candle is the buy when it closes up and trades that block.
+// The short is the mirror. One signal per DRT. Swings and signals use
+// confirmed bars, so a forming candle does not print or move them.
+// tests/test_drt_mss_pullback.py is the sequence spec.
+
+string GRP_STRUCTURE = "Structure"
+int swingLeft = input.int(2, "Swing left", minval = 1, maxval = 20, group = GRP_STRUCTURE,
+     tooltip = "Bars to the left of a swing. A swing is confirmed only after Swing right bars have closed beyond it.")
+int swingRight = input.int(2, "Swing right", minval = 1, maxval = 20, group = GRP_STRUCTURE,
+     tooltip = "Bars to the right of a swing. 2 ignores a one-bar spike. Lower this if the shifts on your chart are smaller.")
+int maxBars = input.int(80, "Setup expires after", minval = 0, group = GRP_STRUCTURE,
+     tooltip = "Bars after the MSS. 0 keeps the setup until it signals, a new MSS replaces it, or the far side breaks.")
+bool cancelBeyond = input.bool(true, "Cancel on a close through the far side", group = GRP_STRUCTURE,
+     tooltip = "A bullish DRT cancels if a candle closes below its low. A bearish DRT cancels if a candle closes above its high. A wick does not cancel it. A new MSS replaces the range instead.")
+
+string GRP_OB = "Order block"
+string obMode = input.string("Full candle", "Order block range", options = ["Full candle", "Body"], group = GRP_OB,
+     tooltip = "Full candle uses the high and low. Body uses the open and close.")
+
+string GRP_DISPLAY = "Display"
+bool showLevels = input.bool(true, "Show DRT high, EQ, and low", group = GRP_DISPLAY)
+bool showNotes = input.bool(true, "Show MSS, sweep, and engulfing", group = GRP_DISPLAY)
+bool showOb = input.bool(true, "Show order block", group = GRP_DISPLAY)
+bool showSignals = input.bool(true, "Show buy/sell signals", group = GRP_DISPLAY)
+
+string GRP_COLOR = "Colors"
+color levelColor = input.color(color.black, "DRT levels", group = GRP_COLOR)
+color noteColor = input.color(color.rgb(67, 160, 71), "Sweep and engulfing", group = GRP_COLOR)
+color obColor = input.color(color.rgb(149, 117, 205), "Order block", group = GRP_COLOR)
+color buyColor = input.color(color.rgb(141, 74, 70), "Buy", group = GRP_COLOR)
+color sellColor = input.color(color.rgb(33, 87, 145), "Sell", group = GRP_COLOR)
+
+int PHASE_SWEEP = 1
+int PHASE_ENGULF = 2
+int PHASE_PULL = 3
+int PHASE_DONE = 4
+int PHASE_CANCEL = 5
+
+string tfTag = timeframe.isminutes ? str.tostring(timeframe.multiplier) + "M" : timeframe.period
+bool bodyOnly = obMode == "Body"
+// A newer bar at the same price replaces the swing. An older bar at the same price does not.
+float pivotHigh = ta.pivothigh(high, swingLeft, swingRight)
+float pivotLow = ta.pivotlow(low, swingLeft, swingRight)
+bool bearEngulf = bar_index > 0 and close < open and close[1] > open[1] and open >= close[1] and close <= open[1]
+bool bullEngulf = bar_index > 0 and close > open and close[1] < open[1] and open <= close[1] and close >= open[1]
+
+var int structure = 0
+var float activeHigh = na
+var float activeLow = na
+var float lastHigh = na
+var int lastHighBar = na
+var float lastLow = na
+var int lastLowBar = na
+var float lowBeforeHigh = na
+var float highBeforeLow = na
+var int phase = 0
+var int drtDir = 0
+var float drtHigh = na
+var float drtLow = na
+var float drtEq = na
+var int drtBar = na
+var bool tookExtreme = false
+var int sweepBar = na
+var int engulfBar = na
+var bool eqSeen = false
+var bool obSet = false
+var int obBar = na
+var float obTop = na
+var float obBot = na
+var bool obCommitted = false
+
+var line highLine = na
+var line eqLine = na
+var line lowLine = na
+var label highLabel = na
+var label eqLabel = na
+var label lowLabel = na
+var line sweepLine = na
+var label sweepLabel = na
+var line engulfLine = na
+var label engulfLabel = na
+var label mssLabel = na
+var box obBox = na
+
+bool buySignal = false
+bool sellSignal = false
+bool installed = false
+
+if barstate.isconfirmed
+    bool bullBreak = not na(activeHigh) and close > activeHigh
+    bool bearBreak = not na(activeLow) and close < activeLow
+    if bullBreak and not bearBreak
+        bool validBull = structure == -1 and not na(lowBeforeHigh) and lowBeforeHigh < activeHigh
+        if validBull
+            structure := 1
+            drtDir := 1
+            drtLow := lowBeforeHigh
+            drtHigh := activeHigh
+            drtEq := (drtHigh + drtLow) * 0.5
+            drtBar := bar_index
+            phase := PHASE_SWEEP
+            tookExtreme := false
+            sweepBar := na
+            engulfBar := na
+            eqSeen := false
+            obSet := false
+            obBar := na
+            obTop := na
+            obBot := na
+            installed := true
+        else
+            if structure == -1 and (phase == PHASE_SWEEP or phase == PHASE_ENGULF or phase == PHASE_PULL)
+                phase := PHASE_CANCEL
+            structure := 1
+        activeHigh := na
+    else if bearBreak and not bullBreak
+        bool validBear = structure == 1 and not na(highBeforeLow) and highBeforeLow > activeLow
+        if validBear
+            structure := -1
+            drtDir := -1
+            drtLow := activeLow
+            drtHigh := highBeforeLow
+            drtEq := (drtHigh + drtLow) * 0.5
+            drtBar := bar_index
+            phase := PHASE_SWEEP
+            tookExtreme := false
+            sweepBar := na
+            engulfBar := na
+            eqSeen := false
+            obSet := false
+            obBar := na
+            obTop := na
+            obBot := na
+            installed := true
+        else
+            if structure == 1 and (phase == PHASE_SWEEP or phase == PHASE_ENGULF or phase == PHASE_PULL)
+                phase := PHASE_CANCEL
+            structure := -1
+        activeLow := na
+
+    if not na(pivotHigh)
+        int highBar = bar_index - swingRight
+        lastHigh := pivotHigh
+        lastHighBar := highBar
+        if not na(lastLow) and lastLowBar < highBar
+            lowBeforeHigh := lastLow
+        activeHigh := pivotHigh
+    if not na(pivotLow)
+        int lowBar = bar_index - swingRight
+        lastLow := pivotLow
+        lastLowBar := lowBar
+        if not na(lastHigh) and lastHighBar < lowBar
+            highBeforeLow := lastHigh
+        activeLow := pivotLow
+
+if barstate.isconfirmed and not installed and (phase == PHASE_SWEEP or phase == PHASE_ENGULF or phase == PHASE_PULL)
+    bool expired = maxBars > 0 and bar_index - drtBar > maxBars
+    bool brokeFar = cancelBeyond and ((drtDir == 1 and close < drtLow) or (drtDir == -1 and close > drtHigh))
+    if expired or brokeFar
+        phase := PHASE_CANCEL
+    else
+        if phase == PHASE_SWEEP and bar_index > drtBar
+            if drtDir == 1
+                if high > drtHigh
+                    tookExtreme := true
+                if tookExtreme and close < drtHigh
+                    phase := PHASE_ENGULF
+                    sweepBar := bar_index
+            else
+                if low < drtLow
+                    tookExtreme := true
+                if tookExtreme and close > drtLow
+                    phase := PHASE_ENGULF
+                    sweepBar := bar_index
+
+        if phase == PHASE_ENGULF and not na(sweepBar) and bar_index >= sweepBar
+            if drtDir == 1 and bearEngulf
+                phase := PHASE_PULL
+                engulfBar := bar_index
+            else if drtDir == -1 and bullEngulf
+                phase := PHASE_PULL
+                engulfBar := bar_index
+
+        if phase == PHASE_PULL and not na(engulfBar) and bar_index > engulfBar
+            if obSet and bar_index > obBar + 1
+                obSet := false
+            if drtDir == 1
+                if low <= drtEq
+                    eqSeen := true
+                if eqSeen and obSet and bar_index == obBar + 1
+                    bool overlaps = low <= obTop and high >= obBot
+                    if close > open and overlaps
+                        phase := PHASE_DONE
+                        buySignal := true
+                    else if close < open and low <= drtEq
+                        obTop := bodyOnly ? math.max(open, close) : high
+                        obBot := bodyOnly ? math.min(open, close) : low
+                        obBar := bar_index
+                        obSet := true
+                    else
+                        obSet := false
+                else if eqSeen and not obSet and close < open and low <= drtEq
+                    obTop := bodyOnly ? math.max(open, close) : high
+                    obBot := bodyOnly ? math.min(open, close) : low
+                    obBar := bar_index
+                    obSet := true
+            else
+                if high >= drtEq
+                    eqSeen := true
+                if eqSeen and obSet and bar_index == obBar + 1
+                    bool overlapsBear = low <= obTop and high >= obBot
+                    if close < open and overlapsBear
+                        phase := PHASE_DONE
+                        sellSignal := true
+                    else if close > open and high >= drtEq
+                        obTop := bodyOnly ? math.max(open, close) : high
+                        obBot := bodyOnly ? math.min(open, close) : low
+                        obBar := bar_index
+                        obSet := true
+                    else
+                        obSet := false
+                else if eqSeen and not obSet and close > open and high >= drtEq
+                    obTop := bodyOnly ? math.max(open, close) : high
+                    obBot := bodyOnly ? math.min(open, close) : low
+                    obBar := bar_index
+                    obSet := true
+
+if barstate.isconfirmed and drtBar == bar_index
+    if not na(mssLabel)
+        label.delete(mssLabel)
+        mssLabel := na
+    if not na(sweepLine)
+        line.delete(sweepLine)
+        sweepLine := na
+    if not na(sweepLabel)
+        label.delete(sweepLabel)
+        sweepLabel := na
+    if not na(engulfLine)
+        line.delete(engulfLine)
+        engulfLine := na
+    if not na(engulfLabel)
+        label.delete(engulfLabel)
+        engulfLabel := na
+    if not obCommitted and not na(obBox)
+        box.delete(obBox)
+        obBox := na
+    if not na(highLine)
+        line.delete(highLine)
+        highLine := na
+    if not na(eqLine)
+        line.delete(eqLine)
+        eqLine := na
+    if not na(lowLine)
+        line.delete(lowLine)
+        lowLine := na
+    if not na(highLabel)
+        label.delete(highLabel)
+        highLabel := na
+    if not na(eqLabel)
+        label.delete(eqLabel)
+        eqLabel := na
+    if not na(lowLabel)
+        label.delete(lowLabel)
+        lowLabel := na
+    if showLevels
+        highLine := line.new(bar_index, drtHigh, bar_index + 1, drtHigh, extend = extend.right, color = levelColor, width = 1)
+        eqLine := line.new(bar_index, drtEq, bar_index + 1, drtEq, extend = extend.right, style = line.style_dashed, color = levelColor, width = 1)
+        lowLine := line.new(bar_index, drtLow, bar_index + 1, drtLow, extend = extend.right, color = levelColor, width = 1)
+        highLabel := label.new(bar_index, drtHigh, tfTag + " DRT High", style = label.style_label_left, color = color.new(color.white, 100), textcolor = levelColor, size = size.small)
+        eqLabel := label.new(bar_index, drtEq, tfTag + " DRT EQ", style = label.style_label_left, color = color.new(color.white, 100), textcolor = levelColor, size = size.small)
+        lowLabel := label.new(bar_index, drtLow, tfTag + " DRT Low", style = label.style_label_left, color = color.new(color.white, 100), textcolor = levelColor, size = size.small)
+    if showNotes
+        mssLabel := label.new(bar_index, drtDir == 1 ? high : low, "MSS",
+             style = drtDir == 1 ? label.style_label_down : label.style_label_up,
+             color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny)
+
+if barstate.isconfirmed and showLevels and not na(highLabel)
+    label.set_x(highLabel, bar_index)
+    label.set_x(eqLabel, bar_index)
+    label.set_x(lowLabel, bar_index)
+
+if barstate.isconfirmed and showNotes and sweepBar == bar_index
+    if not na(sweepLine)
+        line.delete(sweepLine)
+    if not na(sweepLabel)
+        label.delete(sweepLabel)
+    float sweepPrice = drtDir == 1 ? drtHigh : drtLow
+    sweepLine := line.new(bar_index, sweepPrice, bar_index + 10, sweepPrice, color = noteColor, width = 2)
+    sweepLabel := label.new(bar_index + 4, sweepPrice, "sweep", style = label.style_none, textcolor = noteColor, size = size.small)
+
+if barstate.isconfirmed and showNotes and engulfBar == bar_index
+    if not na(engulfLine)
+        line.delete(engulfLine)
+    if not na(engulfLabel)
+        label.delete(engulfLabel)
+    engulfLine := line.new(bar_index, open, bar_index + 22, open, color = noteColor, width = 1)
+    engulfLabel := label.new(bar_index + 12, open, "Engulfing", style = label.style_none, textcolor = noteColor, size = size.small)
+
+if barstate.isconfirmed and showOb and obSet and obBar == bar_index
+    if not na(obBox) and not obCommitted
+        box.delete(obBox)
+    obBox := box.new(obBar, obTop, bar_index, obBot, bgcolor = color.new(obColor, 72), border_color = color.new(obColor, 15),
+         text = "OB", text_color = obColor, text_size = size.small)
+    obCommitted := false
+
+if barstate.isconfirmed and (buySignal or sellSignal)
+    obCommitted := true
+
+if barstate.isconfirmed and not na(obBox)
+    box.set_right(obBox, obCommitted ? obBar + 4 : bar_index)
+
+if barstate.isconfirmed and showSignals and buySignal
+    label.new(bar_index, low, "BUY", style = label.style_label_up, color = buyColor, textcolor = color.white, size = size.normal)
+if barstate.isconfirmed and showSignals and sellSignal
+    label.new(bar_index, high, "SELL", style = label.style_label_down, color = sellColor, textcolor = color.white, size = size.normal)
+
+alertcondition(buySignal, "DRT Buy", "DRT Buy")
+alertcondition(sellSignal, "DRT Sell", "DRT Sell")
